@@ -27,6 +27,7 @@ from instructions import InstructionLoader
 from sessions import SessionStore, Session
 from subagents import SubAgentManager, SubAgentType
 from hooks import HooksManager, HookEvent, HookContext
+from self_improve import SelfImprover
 
 
 # Constants (inspired by OpenCode)
@@ -71,6 +72,7 @@ class AgentConfig:
     enable_sessions: bool = True  # Enable session persistence
     session_id: Optional[str] = None  # Resume specific session
     enable_hooks: bool = True  # Enable hooks system
+    enable_self_improve: bool = True  # Enable self-improvement system
 
 
 @dataclass
@@ -228,6 +230,14 @@ class CodingAgent:
         self.hooks_manager: Optional[HooksManager] = None
         if self.config.enable_hooks:
             self.hooks_manager = HooksManager(
+                working_dir=self.config.working_dir,
+                verbose=self.config.verbose
+            )
+
+        # Initialize self-improvement system
+        self.self_improver: Optional[SelfImprover] = None
+        if self.config.enable_self_improve:
+            self.self_improver = SelfImprover(
                 working_dir=self.config.working_dir,
                 verbose=self.config.verbose
             )
@@ -557,23 +567,30 @@ class CodingAgent:
         except Exception as e:
             return f"Error executing sub-agent: {str(e)}"
 
-    def _process_with_tools(self, response: str) -> tuple[str, bool]:
-        """Process response for tool calls and execute them."""
+    def _process_with_tools(self, response: str) -> tuple[str, bool, dict]:
+        """Process response for tool calls and execute them.
+
+        Returns:
+            (processed_response, has_tools, tool_results_summary)
+        """
         tool_calls = self._parse_tool_calls(response)
 
         if not tool_calls:
-            return response, False
+            return response, False, {}
 
         results = []
+        tool_results_summary = {"success": True, "errors": []}
+
         for call in tool_calls:
             tool_name = call["tool"]
             params = call["params"]
 
             # Check for doom loop
             if self._check_doom_loop(tool_name, params):
-                results.append(f"[{tool_name} BLOCKED - doom loop detected]\n"
-                               f"Same tool called {DOOM_LOOP_THRESHOLD}+ times with identical params. "
-                               f"Try a different approach or ask for help.")
+                error_msg = f"Same tool called {DOOM_LOOP_THRESHOLD}+ times with identical params"
+                results.append(f"[{tool_name} BLOCKED - doom loop detected]\n{error_msg}. Try a different approach.")
+                tool_results_summary["success"] = False
+                tool_results_summary["errors"].append({"tool": tool_name, "error": "doom_loop"})
                 continue
 
             if self.config.verbose:
@@ -582,6 +599,11 @@ class CodingAgent:
 
             result = self._execute_tool(tool_name, params)
 
+            # Track errors for self-improvement
+            if "Error" in result or "Unknown tool" in result:
+                tool_results_summary["success"] = False
+                tool_results_summary["errors"].append({"tool": tool_name, "error": result[:200]})
+
             if self.config.verbose:
                 preview = result[:500] + "..." if len(result) > 500 else result
                 print(f"Result: {preview}")
@@ -589,7 +611,7 @@ class CodingAgent:
             results.append(f"[{tool_name} result]\n{result}")
 
         tool_results = "\n\n".join(results)
-        return f"{response}\n\n{tool_results}", True
+        return f"{response}\n\n{tool_results}", True, tool_results_summary
 
     def _should_use_tool(self, user_message: str) -> Optional[str]:
         """Hint which tool the user likely needs."""
@@ -656,8 +678,15 @@ class CodingAgent:
 
         # Process tool calls iteratively
         iterations = 0
+        all_tool_results = {"success": True, "errors": []}
+
         while iterations < self.config.max_iterations:
-            processed_response, has_tools = self._process_with_tools(response)
+            processed_response, has_tools, tool_results = self._process_with_tools(response)
+
+            # Aggregate tool results for self-improvement
+            if not tool_results.get("success", True):
+                all_tool_results["success"] = False
+                all_tool_results["errors"].extend(tool_results.get("errors", []))
 
             if not has_tools:
                 break
@@ -681,7 +710,38 @@ class CodingAgent:
         # Execute post_message hooks
         self._execute_hooks(HookEvent.POST_MESSAGE, response=final_response)
 
+        # Self-improvement: process interaction for learning
+        if self.self_improver:
+            # Check if user is providing a correction
+            user_correction = self._detect_user_correction(user_message)
+
+            self.self_improver.process_interaction(
+                user_message=user_message,
+                assistant_response=response,
+                tool_results=all_tool_results if all_tool_results["errors"] else None,
+                success=all_tool_results["success"],
+                user_feedback=user_correction
+            )
+
         return final_response
+
+    def _detect_user_correction(self, message: str) -> Optional[str]:
+        """Detect if user is correcting a previous response."""
+        correction_patterns = [
+            r"no,?\s+(?:that'?s?\s+)?wrong",
+            r"incorrect",
+            r"that'?s?\s+not\s+(?:right|correct)",
+            r"you\s+should\s+(?:have\s+)?use[d]?",
+            r"the\s+correct\s+(?:way|format|answer)",
+            r"actually,?\s+(?:it'?s?|you)",
+        ]
+
+        msg_lower = message.lower()
+        for pattern in correction_patterns:
+            if re.search(pattern, msg_lower):
+                return message  # Return the full message as feedback
+
+        return None
 
     def _clean_response(self, response: str) -> str:
         """Remove tool XML tags from response."""
@@ -709,7 +769,7 @@ class CodingAgent:
             full_response += chunk
             yield chunk
 
-        processed, has_tools = self._process_with_tools(full_response)
+        processed, has_tools, tool_results = self._process_with_tools(full_response)
 
         if has_tools:
             self.messages.append(Message(role="assistant", content=processed))
@@ -745,7 +805,28 @@ class CodingAgent:
             stats["session_id"] = self.session.id
             stats["session_title"] = self.session.title
 
+        # Add self-improvement stats
+        if self.self_improver:
+            improve_stats = self.self_improver.get_stats()
+            stats["self_improve"] = {
+                "failures_captured": improve_stats["total_failures"],
+                "failures_fixed": improve_stats["failures_fixed"],
+                "patterns_learned": improve_stats["patterns_learned"],
+            }
+
         return stats
+
+    def get_improvement_stats(self) -> dict:
+        """Get detailed self-improvement statistics."""
+        if not self.self_improver:
+            return {"enabled": False}
+        return self.self_improver.get_stats()
+
+    def analyze_improvements(self) -> dict:
+        """Analyze improvement patterns."""
+        if not self.self_improver:
+            return {"enabled": False}
+        return self.self_improver.analyze_patterns()
 
     def get_session_id(self) -> Optional[str]:
         """Get current session ID."""

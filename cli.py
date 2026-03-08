@@ -54,6 +54,7 @@ def print_banner():
 ║    /mcp      - List MCP servers and tools                     ║
 ║    /bg       - Run task in background                         ║
 ║    /tasks    - List background tasks                          ║
+║    /improve  - Self-improvement stats & analysis              ║
 ║    /init     - Create ZIMA.md template                        ║
 ║    /exit     - Exit the assistant                             ║
 ╚═══════════════════════════════════════════════════════════════╝
@@ -211,6 +212,52 @@ def handle_command(command: str, agent: CodingAgent, skills_manager: SkillsManag
         console.print(f"  • Compacted: {stats['compacted']}")
         console.print(f"  • Instructions loaded: {stats['instructions_loaded']}")
         console.print(f"  • Model: {stats['model']}")
+
+        # Self-improvement stats
+        if stats.get('self_improve'):
+            si = stats['self_improve']
+            console.print(f"\n[bold]Self-Improvement:[/bold]")
+            console.print(f"  • Failures captured: {si['failures_captured']}")
+            console.print(f"  • Failures fixed: {si['failures_fixed']}")
+            console.print(f"  • Patterns learned: {si['patterns_learned']}")
+        console.print()
+
+    elif cmd == "/improve":
+        if args == "analyze":
+            analysis = agent.analyze_improvements()
+            if analysis.get("enabled") is False:
+                console.print("[yellow]Self-improvement is disabled.[/yellow]")
+            else:
+                console.print("\n[bold]Failure Pattern Analysis:[/bold]")
+                if analysis.get("most_common_failures"):
+                    console.print("\nMost Common Failures:")
+                    for category, count in analysis["most_common_failures"]:
+                        console.print(f"  • {category}: {count}")
+                if analysis.get("recommendations"):
+                    console.print("\nRecommendations:")
+                    for rec in analysis["recommendations"]:
+                        console.print(f"  → {rec}")
+        elif args == "rebuild":
+            if agent.self_improver:
+                console.print("[cyan]Rebuilding Modelfile with learned patterns...[/cyan]")
+                agent.self_improver._trigger_rebuild()
+                console.print("[green]Done. Run: ollama create coding-assistant -f Modelfile[/green]")
+            else:
+                console.print("[yellow]Self-improvement is disabled.[/yellow]")
+        else:
+            stats = agent.get_improvement_stats()
+            if stats.get("enabled") is False:
+                console.print("[yellow]Self-improvement is disabled.[/yellow]")
+            else:
+                console.print("\n[bold]Self-Improvement Statistics:[/bold]")
+                console.print(f"  • Total failures: {stats['total_failures']}")
+                console.print(f"  • Failures fixed: {stats['failures_fixed']}")
+                console.print(f"  • Fix rate: {stats['fix_rate']}")
+                console.print(f"  • Training examples added: {stats['training_examples_added']}")
+                console.print(f"  • Patterns learned: {stats['patterns_learned']}")
+                if stats.get('last_training_update'):
+                    console.print(f"  • Last rebuild: {stats['last_training_update'][:19]}")
+                console.print(f"\n[dim]Commands: /improve analyze, /improve rebuild[/dim]")
         console.print()
 
     elif cmd == "/init":
