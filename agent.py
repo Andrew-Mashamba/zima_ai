@@ -710,18 +710,34 @@ class CodingAgent:
         # Execute post_message hooks
         self._execute_hooks(HookEvent.POST_MESSAGE, response=final_response)
 
-        # Self-improvement: process interaction for learning
+        # Self-improvement: Claude audits and fixes if needed
         if self.self_improver:
             # Check if user is providing a correction
             user_correction = self._detect_user_correction(user_message)
 
-            self.self_improver.process_interaction(
+            # Audit with Claude and get fixes if needed
+            audit_result = self.self_improver.audit_and_improve(
                 user_message=user_message,
-                assistant_response=response,
+                zima_response=response,
                 tool_results=all_tool_results if all_tool_results["errors"] else None,
-                success=all_tool_results["success"],
-                user_feedback=user_correction
             )
+
+            # If Claude found issues and fixed them, use the fixed response
+            if audit_result and audit_result.needs_fix and audit_result.fixed_response:
+                if self.config.verbose:
+                    print(f"\n[SelfImprove] Claude fixed the response (score: {audit_result.score})")
+                    for improvement in audit_result.improvements_applied:
+                        print(f"  ✓ {improvement}")
+
+                # Use Claude's fixed response instead
+                final_response = audit_result.fixed_response
+
+                # Update the message in history with the fixed response
+                self.messages[-1] = Message(role="assistant", content=final_response)
+
+                # Persist corrected message to session store
+                if self.session_store and self.session:
+                    self.session_store.add_message(self.session.id, self.messages[-1])
 
         return final_response
 

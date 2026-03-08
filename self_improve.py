@@ -1,29 +1,32 @@
 """
-Zima AI - Self-Improvement System
+Zima AI - Self-Improvement System with Claude Auditor
 
-Autonomous feedback loop for continuous improvement:
-1. Capture failed generations (tool errors, parse failures, user corrections)
-2. Auto-fix issues using the LLM
-3. Add corrective examples to training data
-4. Rebuild Modelfile with learned patterns
+Autonomous feedback loop where Claude CLI:
+1. Audits Zima's responses for correctness
+2. Fixes any issues automatically
+3. Updates training data with corrections
+4. Improves system prompts to prevent future issues
 
 Usage:
     from self_improve import SelfImprover
 
     improver = SelfImprover(working_dir="/path/to/project")
 
-    # After each interaction, optionally process
-    improver.process_interaction(
-        user_message="List files",
-        assistant_response="<tool>ls</tool>",  # Wrong format
-        tool_results={"error": "Unknown tool: ls"},
-        success=False
+    # After Zima responds, audit with Claude
+    result = improver.audit_and_improve(
+        user_message="Create a User model",
+        zima_response="<tool>bash</tool><command>php artisan make:model User</command>",
+        context={"files": ["app/Models/User.php"]}
     )
+
+    if result.needs_fix:
+        fixed_response = result.fixed_response
 """
 
-import json
+import os
 import re
-import hashlib
+import json
+import subprocess
 from pathlib import Path
 from dataclasses import dataclass, field
 from typing import Optional, Any
@@ -35,187 +38,222 @@ from enum import Enum
 # TYPES
 # =============================================================================
 
-class FailureCategory(Enum):
-    """Categories of failures for analysis."""
-    TOOL_FORMAT = "tool_format"          # Wrong XML format
-    TOOL_SELECTION = "tool_selection"    # Wrong tool for task
-    COMMAND_AS_TOOL = "command_as_tool"  # Used command name as tool
-    PARSE_ERROR = "parse_error"          # Response couldn't be parsed
-    EXECUTION_ERROR = "execution_error"  # Tool execution failed
-    INCOMPLETE = "incomplete"            # Missing information
-    HALLUCINATION = "hallucination"      # Made up facts/files
-    USER_CORRECTION = "user_correction"  # User corrected the AI
-    DOOM_LOOP = "doom_loop"              # Repeated same action
+class IssueCategory(Enum):
+    """Categories of issues found by Claude auditor."""
+    SYNTAX = "syntax"              # Code syntax errors
+    LOGIC = "logic"                # Logic/implementation errors
+    SECURITY = "security"          # Security vulnerabilities
+    TOOL_FORMAT = "tool_format"    # Wrong tool XML format
+    INCOMPLETE = "incomplete"      # Missing parts of the solution
+    WRONG_APPROACH = "wrong_approach"  # Fundamentally wrong approach
+    BEST_PRACTICE = "best_practice"    # Not following best practices
+    CONTEXT_MISS = "context_miss"      # Missed important context
+
+
+class IssueSeverity(Enum):
+    """Severity levels for issues."""
+    CRITICAL = "critical"  # Must fix immediately
+    HIGH = "high"          # Should fix
+    MEDIUM = "medium"      # Nice to fix
+    LOW = "low"            # Minor improvement
 
 
 @dataclass
-class FailureRecord:
-    """Record of a failure for learning."""
-    category: FailureCategory
-    user_message: str
-    assistant_response: str
-    error_details: str
-    timestamp: str = field(default_factory=lambda: datetime.now().isoformat())
-    corrected_response: Optional[str] = None
-    root_cause: Optional[str] = None
-    fix_applied: bool = False
+class AuditIssue:
+    """An issue found during audit."""
+    category: IssueCategory
+    severity: IssueSeverity
+    description: str
+    location: str = ""  # Where in the response
+    suggestion: str = ""  # How to fix
+
+
+@dataclass
+class AuditResult:
+    """Result of Claude auditing Zima's response."""
+    score: int  # 0-100
+    passed: bool  # Score >= 80
+    issues: list[AuditIssue] = field(default_factory=list)
+    needs_fix: bool = False
+    fixed_response: Optional[str] = None
+    improvements_applied: list[str] = field(default_factory=list)
+    training_updated: bool = False
 
 
 @dataclass
 class ImprovementStats:
     """Statistics on improvements."""
-    total_failures: int = 0
-    failures_fixed: int = 0
+    total_audits: int = 0
+    audits_passed: int = 0
+    audits_failed: int = 0
+    issues_found: int = 0
+    issues_fixed: int = 0
     training_examples_added: int = 0
-    patterns_learned: int = 0
-    last_training_update: Optional[str] = None
+    prompt_updates: int = 0
+    last_audit: Optional[str] = None
 
 
 # =============================================================================
-# FAILURE DETECTOR
+# CLAUDE CLI INTERFACE
 # =============================================================================
 
-class FailureDetector:
-    """Detect failures in LLM responses."""
+class ClaudeCLI:
+    """Interface to Claude CLI for auditing."""
 
-    # Patterns that indicate tool format errors
-    WRONG_TOOL_PATTERNS = [
-        r'\[Tool:\s*ls',           # [Tool: ls] - command as tool
-        r'\[Tool:\s*php',          # [Tool: php] - command as tool
-        r'\[Tool:\s*npm',          # [Tool: npm] - command as tool
-        r'\[Tool:\s*git\s+',       # [Tool: git status] - command with args
-        r'\[Tool:\s*composer',     # [Tool: composer] - command as tool
-        r'<tool>ls</tool>',        # ls as tool name
-        r'<tool>php</tool>',       # php as tool name
-        r'<tool>npm</tool>',       # npm as tool name
-        r'<tool>python</tool>',    # python as tool name
-    ]
+    def __init__(self, timeout: int = 120, verbose: bool = False):
+        self.timeout = timeout
+        self.verbose = verbose
+        self.claude_path = self._find_claude()
 
-    # Valid tool names
-    VALID_TOOLS = {'bash', 'file_ops', 'web_search', 'laravel_docs', 'git', 'subagent'}
-
-    def detect(self, user_message: str, response: str, tool_results: dict = None) -> Optional[FailureRecord]:
-        """Detect failures in a response."""
-
-        # Check for command-as-tool error
-        for pattern in self.WRONG_TOOL_PATTERNS:
-            if re.search(pattern, response, re.IGNORECASE):
-                return FailureRecord(
-                    category=FailureCategory.COMMAND_AS_TOOL,
-                    user_message=user_message,
-                    assistant_response=response,
-                    error_details=f"Used command as tool name (matched: {pattern})"
-                )
-
-        # Check for invalid tool names in XML
-        tool_matches = re.findall(r'<tool>(\w+)</tool>', response)
-        for tool in tool_matches:
-            if tool.lower() not in self.VALID_TOOLS:
-                return FailureRecord(
-                    category=FailureCategory.TOOL_FORMAT,
-                    user_message=user_message,
-                    assistant_response=response,
-                    error_details=f"Invalid tool name: {tool}"
-                )
-
-        # Check tool execution results
-        if tool_results:
-            if tool_results.get("error"):
-                return FailureRecord(
-                    category=FailureCategory.EXECUTION_ERROR,
-                    user_message=user_message,
-                    assistant_response=response,
-                    error_details=tool_results["error"]
-                )
-
-            if "Unknown tool" in str(tool_results.get("result", "")):
-                return FailureRecord(
-                    category=FailureCategory.TOOL_FORMAT,
-                    user_message=user_message,
-                    assistant_response=response,
-                    error_details=str(tool_results["result"])
-                )
-
-        # Check for hallucination patterns
-        hallucination_patterns = [
-            r'I have created',       # Claiming action without tool
-            r'I have added',         # Claiming action without tool
-            r'I have updated',       # Claiming action without tool
-            r'File saved to',        # Claiming save without file_ops
+    def _find_claude(self) -> str:
+        """Find Claude CLI executable."""
+        paths = [
+            "/Users/andrewmashamba/.npm-global/bin/claude",
+            os.path.expanduser("~/.npm-global/bin/claude"),
+            "/usr/local/bin/claude",
+            "claude",
         ]
-        for pattern in hallucination_patterns:
-            if re.search(pattern, response, re.IGNORECASE):
-                # Only flag if no actual tool call was made
-                if not re.search(r'<tool>\w+</tool>', response):
-                    return FailureRecord(
-                        category=FailureCategory.HALLUCINATION,
-                        user_message=user_message,
-                        assistant_response=response,
-                        error_details=f"Claimed action without using tool (matched: {pattern})"
-                    )
+        for path in paths:
+            try:
+                result = subprocess.run(
+                    [path, "--version"],
+                    capture_output=True,
+                    timeout=5
+                )
+                if result.returncode == 0:
+                    return path
+            except:
+                continue
+        raise RuntimeError("Claude CLI not found. Install with: npm install -g @anthropic-ai/claude-code")
 
-        return None
+    def query(self, prompt: str, expect_json: bool = False) -> dict:
+        """Query Claude CLI with a prompt."""
+        cmd = [
+            self.claude_path,
+            "-p",  # Print mode (non-interactive)
+            "--model", "sonnet",
+            prompt
+        ]
+
+        if self.verbose:
+            print(f"[Claude] Querying...")
+
+        try:
+            result = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                timeout=self.timeout,
+                cwd=str(Path.home())
+            )
+
+            output = result.stdout.strip()
+
+            if expect_json:
+                # Try to extract JSON from output
+                try:
+                    return json.loads(output)
+                except:
+                    # Look for JSON in the text
+                    match = re.search(r'\{[\s\S]*\}', output)
+                    if match:
+                        try:
+                            return json.loads(match.group())
+                        except:
+                            pass
+                    # Try array
+                    match = re.search(r'\[[\s\S]*\]', output)
+                    if match:
+                        try:
+                            return {"items": json.loads(match.group())}
+                        except:
+                            pass
+
+            return {"text": output, "success": result.returncode == 0}
+
+        except subprocess.TimeoutExpired:
+            return {"error": "timeout", "text": ""}
+        except Exception as e:
+            return {"error": str(e), "text": ""}
+
+    def is_available(self) -> bool:
+        """Check if Claude CLI is available."""
+        try:
+            result = subprocess.run(
+                [self.claude_path, "--version"],
+                capture_output=True,
+                timeout=5
+            )
+            return result.returncode == 0
+        except:
+            return False
 
 
 # =============================================================================
-# SELF IMPROVER
+# SELF IMPROVER WITH CLAUDE AUDITOR
 # =============================================================================
 
 class SelfImprover:
     """
-    Self-improvement system for Zima AI.
+    Self-improvement system with Claude CLI auditor.
 
-    Captures failures, generates corrections, and updates training data.
+    Flow:
+    1. Zima responds to user
+    2. Claude audits the response
+    3. If issues found:
+       - Claude fixes the response
+       - Training data updated
+       - System prompt improved
+    4. Fixed response returned to user
     """
 
-    TRAINING_TRIGGER_COUNT = 5  # Rebuild Modelfile after N improvements
+    AUDIT_THRESHOLD = 80  # Score below this triggers fixes
+    TRAINING_TRIGGER_COUNT = 3  # Update Modelfile after N fixes
 
     def __init__(
         self,
         working_dir: Optional[str] = None,
         data_dir: Optional[str] = None,
-        verbose: bool = True
+        verbose: bool = True,
+        auto_audit: bool = True,  # Automatically audit responses
     ):
         self.working_dir = Path(working_dir) if working_dir else Path.cwd()
         self.data_dir = Path(data_dir) if data_dir else Path(__file__).parent / "training"
         self.verbose = verbose
-
-        self.detector = FailureDetector()
+        self.auto_audit = auto_audit
 
         # Ensure directories exist
         self.data_dir.mkdir(parents=True, exist_ok=True)
 
         # Data files
-        self.failures_file = self.data_dir / "failures.jsonl"
+        self.training_file = self.data_dir / "training_data.jsonl"
         self.patterns_file = self.data_dir / "learned_patterns.json"
         self.stats_file = self.data_dir / "improvement_stats.json"
-        self.training_file = self.data_dir / "training_data.jsonl"
+        self.prompt_updates_file = self.data_dir / "prompt_updates.json"
+
+        # Initialize Claude CLI
+        self.claude: Optional[ClaudeCLI] = None
+        try:
+            self.claude = ClaudeCLI(verbose=verbose)
+            if verbose:
+                print(f"[SelfImprove] Claude CLI available for auditing")
+        except Exception as e:
+            if verbose:
+                print(f"[SelfImprove] Claude CLI not available: {e}")
+                print(f"[SelfImprove] Running in basic mode (no external audit)")
 
         # Load state
         self.patterns = self._load_patterns()
         self.stats = self._load_stats()
-        self.pending_improvements = 0
-
-        # LLM client for auto-fix (lazy loaded)
-        self._llm = None
-
-        if verbose:
-            print(f"SelfImprover initialized (data_dir: {self.data_dir})")
-
-    @property
-    def llm(self):
-        """Lazy load LLM client."""
-        if self._llm is None:
-            from ollama_client import OllamaClient, OllamaConfig
-            self._llm = OllamaClient(OllamaConfig(model="coding-assistant", temperature=0.3))
-        return self._llm
+        self.prompt_updates = self._load_prompt_updates()
+        self.pending_fixes = 0
 
     def _load_patterns(self) -> dict:
         """Load learned patterns."""
         if self.patterns_file.exists():
             with open(self.patterns_file) as f:
                 return json.load(f)
-        return {"corrections": [], "failure_types": {}}
+        return {"corrections": [], "failure_types": {}, "learned_rules": []}
 
     def _save_patterns(self):
         """Save learned patterns."""
@@ -234,12 +272,547 @@ class SelfImprover:
         """Save improvement statistics."""
         with open(self.stats_file, 'w') as f:
             json.dump({
-                "total_failures": self.stats.total_failures,
-                "failures_fixed": self.stats.failures_fixed,
+                "total_audits": self.stats.total_audits,
+                "audits_passed": self.stats.audits_passed,
+                "audits_failed": self.stats.audits_failed,
+                "issues_found": self.stats.issues_found,
+                "issues_fixed": self.stats.issues_fixed,
                 "training_examples_added": self.stats.training_examples_added,
-                "patterns_learned": self.stats.patterns_learned,
-                "last_training_update": self.stats.last_training_update,
+                "prompt_updates": self.stats.prompt_updates,
+                "last_audit": self.stats.last_audit,
             }, f, indent=2)
+
+    def _load_prompt_updates(self) -> list:
+        """Load prompt improvement history."""
+        if self.prompt_updates_file.exists():
+            with open(self.prompt_updates_file) as f:
+                return json.load(f)
+        return []
+
+    def _save_prompt_updates(self):
+        """Save prompt updates."""
+        with open(self.prompt_updates_file, 'w') as f:
+            json.dump(self.prompt_updates[-50:], f, indent=2)  # Keep last 50
+
+    def audit_and_improve(
+        self,
+        user_message: str,
+        zima_response: str,
+        context: dict = None,
+        tool_results: dict = None,
+    ) -> AuditResult:
+        """
+        Main entry point: Audit Zima's response and improve if needed.
+
+        Args:
+            user_message: What the user asked
+            zima_response: Zima's response
+            context: Additional context (files, project info, etc.)
+            tool_results: Results from any tool executions
+
+        Returns:
+            AuditResult with score, issues, and fixed response if needed
+        """
+        self.stats.total_audits += 1
+        self.stats.last_audit = datetime.now().isoformat()
+
+        # If Claude CLI not available, do basic checks only
+        if not self.claude:
+            return self._basic_audit(user_message, zima_response, tool_results)
+
+        if self.verbose:
+            print(f"\n[SelfImprove] Auditing response with Claude...")
+
+        # Step 1: Claude audits the response
+        audit = self._claude_audit(user_message, zima_response, context, tool_results)
+
+        result = AuditResult(
+            score=audit.get("score", 50),
+            passed=audit.get("score", 50) >= self.AUDIT_THRESHOLD,
+            issues=[],
+        )
+
+        # Parse issues
+        for issue_data in audit.get("issues", []):
+            try:
+                result.issues.append(AuditIssue(
+                    category=IssueCategory(issue_data.get("category", "logic")),
+                    severity=IssueSeverity(issue_data.get("severity", "medium")),
+                    description=issue_data.get("description", ""),
+                    location=issue_data.get("location", ""),
+                    suggestion=issue_data.get("suggestion", ""),
+                ))
+            except:
+                pass
+
+        self.stats.issues_found += len(result.issues)
+
+        if self.verbose:
+            print(f"[SelfImprove] Score: {result.score}/100 | Issues: {len(result.issues)}")
+
+        # Step 2: If score below threshold, fix the response
+        if result.score < self.AUDIT_THRESHOLD:
+            self.stats.audits_failed += 1
+            result.needs_fix = True
+
+            if self.verbose:
+                print(f"[SelfImprove] Score below {self.AUDIT_THRESHOLD}, fixing...")
+
+            # Claude fixes the response
+            fixed = self._claude_fix(user_message, zima_response, result.issues, context)
+            if fixed:
+                result.fixed_response = fixed
+                self.stats.issues_fixed += len(result.issues)
+
+                # Step 3: Update training data
+                self._add_training_example(user_message, zima_response, fixed, result.issues)
+                result.training_updated = True
+                result.improvements_applied.append("Added corrective training example")
+
+                # Step 4: Learn patterns and update prompts
+                self._learn_from_issues(result.issues)
+                result.improvements_applied.append("Updated learned patterns")
+
+                self.pending_fixes += 1
+
+                # Step 5: Trigger Modelfile rebuild if needed
+                if self.pending_fixes >= self.TRAINING_TRIGGER_COUNT:
+                    self._update_system_prompt(result.issues)
+                    self._trigger_rebuild()
+                    result.improvements_applied.append("Rebuilt Modelfile")
+                    self.pending_fixes = 0
+
+                if self.verbose:
+                    print(f"[SelfImprove] Fixed response generated")
+                    print(f"[SelfImprove] Improvements: {', '.join(result.improvements_applied)}")
+        else:
+            self.stats.audits_passed += 1
+            if self.verbose:
+                print(f"[SelfImprove] Response passed audit")
+
+        self._save_stats()
+        return result
+
+    def _claude_audit(
+        self,
+        user_message: str,
+        zima_response: str,
+        context: dict = None,
+        tool_results: dict = None,
+    ) -> dict:
+        """Use Claude to audit Zima's response."""
+
+        context_str = ""
+        if context:
+            context_str = f"\nContext: {json.dumps(context, indent=2)}"
+
+        tool_str = ""
+        if tool_results:
+            tool_str = f"\nTool execution results: {json.dumps(tool_results, indent=2)}"
+
+        prompt = f"""Audit this AI coding assistant response. Return JSON only.
+
+USER REQUEST:
+{user_message}
+
+AI RESPONSE:
+{zima_response}
+{context_str}
+{tool_str}
+
+AUDIT CRITERIA:
+1. Did the AI correctly understand the request?
+2. Is the solution technically correct (syntax, logic)?
+3. Does it follow best practices?
+4. Is it complete (nothing missing)?
+5. Is it secure (no vulnerabilities)?
+6. Is the tool usage correct? (Tools must use XML format: <tool>name</tool><param>value</param>)
+
+TOOL FORMAT RULES:
+- Commands like ls, php, npm must use: <tool>bash</tool><command>...</command>
+- File operations: <tool>file_ops</tool><action>read|write</action><path>...</path>
+- WRONG: [Tool: ls] or <tool>ls</tool>
+- RIGHT: <tool>bash</tool><command>ls</command>
+
+Return JSON:
+{{
+  "score": 0-100,
+  "summary": "brief assessment",
+  "issues": [
+    {{
+      "category": "syntax|logic|security|tool_format|incomplete|wrong_approach|best_practice|context_miss",
+      "severity": "critical|high|medium|low",
+      "description": "what's wrong",
+      "location": "where in response",
+      "suggestion": "how to fix"
+    }}
+  ]
+}}"""
+
+        result = self.claude.query(prompt, expect_json=True)
+
+        if "error" in result:
+            return {"score": 50, "issues": []}
+
+        return result
+
+    def _claude_fix(
+        self,
+        user_message: str,
+        zima_response: str,
+        issues: list[AuditIssue],
+        context: dict = None,
+    ) -> Optional[str]:
+        """Use Claude to fix Zima's response."""
+
+        issues_str = "\n".join([
+            f"- [{i.severity.value}] {i.category.value}: {i.description} → {i.suggestion}"
+            for i in issues
+        ])
+
+        context_str = ""
+        if context:
+            context_str = f"\nContext: {json.dumps(context, indent=2)}"
+
+        prompt = f"""Fix this AI coding assistant response based on the issues found.
+
+USER REQUEST:
+{user_message}
+
+ORIGINAL RESPONSE (has issues):
+{zima_response}
+{context_str}
+
+ISSUES FOUND:
+{issues_str}
+
+TOOL FORMAT RULES (CRITICAL):
+- Commands must use bash tool: <tool>bash</tool><command>ls -la</command>
+- File read: <tool>file_ops</tool><action>read</action><path>file.php</path>
+- For showing code examples, just display the code (no tool call needed)
+- For executing commands, always wrap in bash tool
+
+Provide the FIXED response. Include:
+1. Correct tool usage (if tools are needed)
+2. Complete solution
+3. Proper code/explanation
+
+Return ONLY the fixed response, nothing else."""
+
+        result = self.claude.query(prompt)
+
+        if "error" in result:
+            return None
+
+        fixed = result.get("text", "")
+
+        # Validate the fix has proper tool format if tools are used
+        if "<tool>" in fixed or "command" in user_message.lower():
+            # Check it's using correct format
+            if re.search(r'<tool>(?!bash|file_ops|web_search|git|subagent)', fixed):
+                # Invalid tool name, try to fix
+                fixed = self._fix_tool_format(fixed)
+
+        return fixed.strip() if fixed else None
+
+    def _fix_tool_format(self, response: str) -> str:
+        """Fix common tool format issues."""
+        # Fix command-as-tool patterns
+        fixes = [
+            (r'<tool>ls</tool>', '<tool>bash</tool><command>ls</command>'),
+            (r'<tool>php</tool>', '<tool>bash</tool><command>php'),
+            (r'<tool>npm</tool>', '<tool>bash</tool><command>npm'),
+            (r'<tool>composer</tool>', '<tool>bash</tool><command>composer'),
+            (r'<tool>git</tool>(?!<action>)', '<tool>bash</tool><command>git'),
+            (r'\[Tool:\s*([^\]]+)\]', r'<tool>bash</tool><command>\1</command>'),
+        ]
+        for pattern, replacement in fixes:
+            response = re.sub(pattern, replacement, response, flags=re.IGNORECASE)
+        return response
+
+    def _add_training_example(
+        self,
+        user_message: str,
+        wrong_response: str,
+        correct_response: str,
+        issues: list[AuditIssue],
+    ):
+        """Add corrective training example."""
+
+        # Create training entry
+        example = {
+            "messages": [
+                {"role": "system", "content": "You are a coding AI assistant. Use tools with exact XML format."},
+                {"role": "user", "content": user_message},
+                {"role": "assistant", "content": correct_response}
+            ],
+            "category": "claude_correction",
+            "issues_fixed": [i.category.value for i in issues],
+            "timestamp": datetime.now().isoformat(),
+        }
+
+        with open(self.training_file, 'a') as f:
+            f.write(json.dumps(example) + "\n")
+
+        # Also add the wrong → right pattern for learning
+        if issues:
+            negative_example = {
+                "messages": [
+                    {"role": "system", "content": "You are a coding AI assistant. Learn from this correction."},
+                    {"role": "user", "content": user_message},
+                    {"role": "assistant", "content": wrong_response[:500]},
+                    {"role": "user", "content": f"ISSUES: {', '.join(i.description for i in issues[:3])}. Correct response:"},
+                    {"role": "assistant", "content": correct_response}
+                ],
+                "category": "claude_correction_with_feedback",
+                "timestamp": datetime.now().isoformat(),
+            }
+            with open(self.training_file, 'a') as f:
+                f.write(json.dumps(negative_example) + "\n")
+
+        self.stats.training_examples_added += 1
+
+    def _learn_from_issues(self, issues: list[AuditIssue]):
+        """Learn patterns from issues to prevent recurrence."""
+
+        for issue in issues:
+            category = issue.category.value
+
+            # Count by category
+            if category not in self.patterns["failure_types"]:
+                self.patterns["failure_types"][category] = 0
+            self.patterns["failure_types"][category] += 1
+
+            # Store the correction rule
+            rule = {
+                "category": category,
+                "description": issue.description,
+                "fix": issue.suggestion,
+                "timestamp": datetime.now().isoformat(),
+            }
+            self.patterns["learned_rules"].append(rule)
+
+        # Keep only recent rules
+        self.patterns["learned_rules"] = self.patterns["learned_rules"][-100:]
+        self._save_patterns()
+
+    def _update_system_prompt(self, issues: list[AuditIssue]):
+        """Generate system prompt improvements based on issues."""
+
+        # Group issues by category
+        categories = {}
+        for issue in issues:
+            cat = issue.category.value
+            if cat not in categories:
+                categories[cat] = []
+            categories[cat].append(issue.suggestion)
+
+        # Generate prompt improvements
+        for category, suggestions in categories.items():
+            update = {
+                "category": category,
+                "rule": f"AVOID {category}: {suggestions[0]}" if suggestions else "",
+                "timestamp": datetime.now().isoformat(),
+            }
+            self.prompt_updates.append(update)
+
+        self._save_prompt_updates()
+        self.stats.prompt_updates += 1
+
+    def _trigger_rebuild(self):
+        """Rebuild Modelfile with learned patterns."""
+        if self.verbose:
+            print(f"\n[SelfImprove] Rebuilding Modelfile with learned patterns...")
+
+        try:
+            # Load current training examples
+            examples = []
+            if self.training_file.exists():
+                with open(self.training_file) as f:
+                    for line in f:
+                        if line.strip():
+                            examples.append(json.loads(line))
+
+            # Get learned rules
+            rules = self.patterns.get("learned_rules", [])[-20:]  # Last 20 rules
+
+            # Generate enhanced Modelfile
+            self._generate_enhanced_modelfile(examples[-30:], rules)
+
+            if self.verbose:
+                print(f"[SelfImprove] Modelfile updated")
+                print(f"[SelfImprove] Run: ollama create coding-assistant -f Modelfile")
+
+        except Exception as e:
+            if self.verbose:
+                print(f"[SelfImprove] Error rebuilding: {e}")
+
+    def _generate_enhanced_modelfile(self, examples: list, rules: list):
+        """Generate Modelfile with learned corrections."""
+
+        # Extract few-shot examples from corrections
+        few_shot = []
+        for ex in examples[-10:]:
+            if "messages" in ex:
+                for msg in ex["messages"]:
+                    if msg["role"] in ("user", "assistant"):
+                        content = msg["content"][:300]
+                        few_shot.append(f"{msg['role'].upper()}: {content}")
+
+        few_shot_text = "\n\n".join(few_shot) if few_shot else ""
+
+        # Extract rules
+        rules_text = ""
+        if rules:
+            rules_list = list(set(r.get("fix", "")[:100] for r in rules if r.get("fix")))[:10]
+            rules_text = "\n".join(f"- {r}" for r in rules_list)
+
+        modelfile = f'''FROM coding-assistant:latest
+
+SYSTEM """You are Zima, a universal coding assistant.
+
+TOOLS (use exact XML format):
+- bash: <tool>bash</tool><command>your command</command>
+- file_ops: <tool>file_ops</tool><action>read|write|list</action><path>path</path>
+- web_search: <tool>web_search</tool><query>search query</query>
+- git: <tool>git</tool><action>status|diff|log|add|commit</action>
+
+CRITICAL RULES:
+1. Commands (ls, php, npm, composer, python) go INSIDE <command> tags
+2. WRONG: <tool>ls</tool> or [Tool: ls]
+3. RIGHT: <tool>bash</tool><command>ls</command>
+4. For showing code, just display it (no tool needed)
+5. For running code, use the bash tool
+
+LEARNED CORRECTIONS:
+{rules_text}
+
+EXAMPLES:
+{few_shot_text}
+"""
+
+PARAMETER temperature 0.3
+PARAMETER top_p 0.9
+'''
+
+        modelfile_path = Path(__file__).parent / "Modelfile"
+        with open(modelfile_path, 'w') as f:
+            f.write(modelfile)
+
+    def _basic_audit(
+        self,
+        user_message: str,
+        zima_response: str,
+        tool_results: dict = None,
+    ) -> AuditResult:
+        """Basic audit without Claude CLI (fallback)."""
+
+        issues = []
+        score = 100
+
+        # Check for common tool format errors
+        wrong_patterns = [
+            (r'\[Tool:\s*\w+\]', "tool_format", "Using [Tool: x] instead of <tool>x</tool>"),
+            (r'<tool>ls</tool>', "tool_format", "Using ls as tool name instead of bash"),
+            (r'<tool>php</tool>', "tool_format", "Using php as tool name instead of bash"),
+            (r'<tool>npm</tool>', "tool_format", "Using npm as tool name instead of bash"),
+        ]
+
+        for pattern, category, description in wrong_patterns:
+            if re.search(pattern, zima_response, re.IGNORECASE):
+                issues.append(AuditIssue(
+                    category=IssueCategory.TOOL_FORMAT,
+                    severity=IssueSeverity.HIGH,
+                    description=description,
+                    suggestion="Use <tool>bash</tool><command>...</command>",
+                ))
+                score -= 20
+
+        # Check tool execution results
+        if tool_results and tool_results.get("errors"):
+            for error in tool_results["errors"]:
+                issues.append(AuditIssue(
+                    category=IssueCategory.LOGIC,
+                    severity=IssueSeverity.HIGH,
+                    description=f"Tool error: {error.get('error', 'Unknown')}",
+                ))
+                score -= 15
+
+        result = AuditResult(
+            score=max(0, score),
+            passed=score >= self.AUDIT_THRESHOLD,
+            issues=issues,
+        )
+
+        if not result.passed:
+            result.needs_fix = True
+            # Try to auto-fix tool format issues
+            fixed = self._fix_tool_format(zima_response)
+            if fixed != zima_response:
+                result.fixed_response = fixed
+
+        self.stats.issues_found += len(issues)
+        if not result.passed:
+            self.stats.audits_failed += 1
+        else:
+            self.stats.audits_passed += 1
+
+        return result
+
+    # ==========================================================================
+    # PUBLIC API
+    # ==========================================================================
+
+    def get_stats(self) -> dict:
+        """Get improvement statistics."""
+        total = self.stats.total_audits or 1
+        return {
+            "total_audits": self.stats.total_audits,
+            "pass_rate": f"{(self.stats.audits_passed / total) * 100:.1f}%",
+            "audits_passed": self.stats.audits_passed,
+            "audits_failed": self.stats.audits_failed,
+            "issues_found": self.stats.issues_found,
+            "issues_fixed": self.stats.issues_fixed,
+            "training_examples_added": self.stats.training_examples_added,
+            "prompt_updates": self.stats.prompt_updates,
+            "last_audit": self.stats.last_audit,
+            "claude_available": self.claude is not None,
+        }
+
+    def analyze_patterns(self) -> dict:
+        """Analyze failure patterns."""
+        analysis = {
+            "most_common_failures": [],
+            "learned_rules_count": len(self.patterns.get("learned_rules", [])),
+            "recommendations": [],
+        }
+
+        # Sort failure types
+        failure_counts = self.patterns.get("failure_types", {})
+        sorted_failures = sorted(failure_counts.items(), key=lambda x: x[1], reverse=True)
+        analysis["most_common_failures"] = sorted_failures[:5]
+
+        # Generate recommendations
+        for category, count in sorted_failures[:3]:
+            if category == "tool_format":
+                analysis["recommendations"].append(
+                    "Strengthen tool format training - commands must use bash wrapper"
+                )
+            elif category == "incomplete":
+                analysis["recommendations"].append(
+                    "Add more complete solution examples to training"
+                )
+            elif category == "security":
+                analysis["recommendations"].append(
+                    "Add security-focused examples and validation patterns"
+                )
+
+        return analysis
+
+    def get_learned_rules(self, limit: int = 10) -> list:
+        """Get recently learned rules."""
+        rules = self.patterns.get("learned_rules", [])
+        return rules[-limit:]
 
     def process_interaction(
         self,
@@ -248,327 +821,24 @@ class SelfImprover:
         tool_results: dict = None,
         success: bool = True,
         user_feedback: str = None
-    ) -> Optional[FailureRecord]:
+    ) -> Optional[AuditResult]:
         """
-        Process an interaction and learn from failures.
+        Process an interaction - compatibility method.
 
-        Args:
-            user_message: The user's input
-            assistant_response: The assistant's response
-            tool_results: Results from tool execution (if any)
-            success: Whether the interaction was successful
-            user_feedback: Optional user correction/feedback
-
-        Returns:
-            FailureRecord if a failure was detected, None otherwise
+        Calls audit_and_improve internally.
         """
-        # Check for user correction
-        if user_feedback:
-            failure = FailureRecord(
-                category=FailureCategory.USER_CORRECTION,
-                user_message=user_message,
-                assistant_response=assistant_response,
-                error_details=f"User correction: {user_feedback}",
-                corrected_response=user_feedback
-            )
-            self._process_failure(failure)
-            return failure
+        if not self.auto_audit:
+            return None
 
-        # Detect failures automatically
-        if not success:
-            failure = self.detector.detect(user_message, assistant_response, tool_results)
-            if failure:
-                self._process_failure(failure)
-                return failure
+        # Skip audit for simple responses
+        if len(assistant_response) < 50 and not tool_results:
+            return None
 
-        return None
-
-    def _process_failure(self, failure: FailureRecord):
-        """Process a detected failure."""
-        if self.verbose:
-            print(f"\n[SelfImprove] Failure detected: {failure.category.value}")
-            print(f"  Error: {failure.error_details[:100]}")
-
-        # Log the failure
-        self._log_failure(failure)
-        self.stats.total_failures += 1
-
-        # Generate correction if possible
-        if not failure.corrected_response:
-            failure.corrected_response = self._generate_correction(failure)
-
-        if failure.corrected_response:
-            # Analyze root cause
-            failure.root_cause = self._analyze_root_cause(failure)
-
-            # Add to training data
-            self._add_training_example(failure)
-            failure.fix_applied = True
-            self.stats.failures_fixed += 1
-            self.stats.training_examples_added += 1
-
-            # Track pattern
-            self._learn_pattern(failure)
-
-            if self.verbose:
-                print(f"  Correction generated and added to training data")
-
-        # Check if we should rebuild
-        self.pending_improvements += 1
-        if self.pending_improvements >= self.TRAINING_TRIGGER_COUNT:
-            self._trigger_rebuild()
-            self.pending_improvements = 0
-
-        self._save_stats()
-
-    def _log_failure(self, failure: FailureRecord):
-        """Log failure to JSONL file."""
-        with open(self.failures_file, 'a') as f:
-            record = {
-                "category": failure.category.value,
-                "user_message": failure.user_message,
-                "assistant_response": failure.assistant_response[:500],
-                "error_details": failure.error_details,
-                "timestamp": failure.timestamp,
-                "corrected": failure.corrected_response is not None,
-            }
-            f.write(json.dumps(record) + "\n")
-
-    def _generate_correction(self, failure: FailureRecord) -> Optional[str]:
-        """Use LLM to generate a corrected response."""
-
-        # Quick fixes for common patterns
-        if failure.category == FailureCategory.COMMAND_AS_TOOL:
-            # Extract the command and wrap it correctly
-            match = re.search(r'\[Tool:\s*([^\]]+)\]', failure.assistant_response)
-            if match:
-                command = match.group(1).strip()
-                return f"<tool>bash</tool><command>{command}</command>"
-
-            match = re.search(r'<tool>(\w+)</tool>', failure.assistant_response)
-            if match:
-                command = match.group(1)
-                if command.lower() in ('ls', 'php', 'npm', 'composer', 'python', 'git'):
-                    # Look for additional context
-                    return f"<tool>bash</tool><command>{command}</command>"
-
-        # For complex cases, use LLM
-        try:
-            prompt = f"""Fix this incorrect AI response.
-
-User asked: "{failure.user_message}"
-
-Incorrect response:
-{failure.assistant_response[:800]}
-
-Error: {failure.error_details}
-
-Rules:
-1. Commands (ls, php, npm, etc.) must use bash tool: <tool>bash</tool><command>...</command>
-2. Valid tools: bash, file_ops, web_search, laravel_docs, git, subagent
-3. For showing code examples, just display the code without tool calls
-4. For executing commands, always use the bash tool
-
-Provide ONLY the corrected response, nothing else."""
-
-            from ollama_client import Message
-            messages = [
-                Message(role="system", content="You fix AI tool usage errors. Return only the corrected response."),
-                Message(role="user", content=prompt)
-            ]
-
-            response = self.llm.chat(messages)
-
-            # Validate the correction
-            if '<tool>' in response and '</tool>' in response:
-                return response.strip()
-
-            # If it's a direct answer (no tool needed), return it
-            if len(response.strip()) > 20:
-                return response.strip()
-
-        except Exception as e:
-            if self.verbose:
-                print(f"  Error generating correction: {e}")
-
-        return None
-
-    def _analyze_root_cause(self, failure: FailureRecord) -> str:
-        """Analyze the root cause of a failure."""
-
-        cause_map = {
-            FailureCategory.COMMAND_AS_TOOL: "Model confused command names with tool names",
-            FailureCategory.TOOL_FORMAT: "Model used incorrect XML format for tools",
-            FailureCategory.TOOL_SELECTION: "Model selected wrong tool for the task",
-            FailureCategory.PARSE_ERROR: "Response format couldn't be parsed",
-            FailureCategory.EXECUTION_ERROR: "Tool execution failed",
-            FailureCategory.INCOMPLETE: "Response missing required information",
-            FailureCategory.HALLUCINATION: "Model claimed actions without using tools",
-            FailureCategory.USER_CORRECTION: "User provided correction to improve response",
-            FailureCategory.DOOM_LOOP: "Model repeated same action multiple times",
-        }
-
-        return cause_map.get(failure.category, "Unknown cause")
-
-    def _add_training_example(self, failure: FailureRecord):
-        """Add corrective example to training data."""
-        if not failure.corrected_response:
-            return
-
-        example = {
-            "messages": [
-                {"role": "system", "content": "You are a coding AI assistant. Use tools with exact XML format."},
-                {"role": "user", "content": failure.user_message},
-                {"role": "assistant", "content": failure.corrected_response}
-            ],
-            "category": f"correction_{failure.category.value}",
-            "learned_from_error": True,
-            "timestamp": failure.timestamp,
-        }
-
-        with open(self.training_file, 'a') as f:
-            f.write(json.dumps(example) + "\n")
-
-        # Also add negative example (what NOT to do) for important patterns
-        if failure.category in (FailureCategory.COMMAND_AS_TOOL, FailureCategory.TOOL_FORMAT):
-            negative_example = {
-                "messages": [
-                    {"role": "system", "content": "You are a coding AI assistant. Use tools with exact XML format."},
-                    {"role": "user", "content": failure.user_message},
-                    {"role": "assistant", "content": failure.assistant_response[:500]},
-                    {"role": "user", "content": f"WRONG: {failure.error_details}. Correct format:"},
-                    {"role": "assistant", "content": failure.corrected_response}
-                ],
-                "category": f"correction_{failure.category.value}_with_feedback",
-                "learned_from_error": True,
-                "timestamp": failure.timestamp,
-            }
-            with open(self.training_file, 'a') as f:
-                f.write(json.dumps(negative_example) + "\n")
-
-    def _learn_pattern(self, failure: FailureRecord):
-        """Learn pattern from failure to prevent recurrence."""
-        category = failure.category.value
-
-        if category not in self.patterns["failure_types"]:
-            self.patterns["failure_types"][category] = 0
-        self.patterns["failure_types"][category] += 1
-
-        # Store correction pattern
-        if failure.corrected_response:
-            pattern = {
-                "error_pattern": failure.error_details[:200],
-                "correction": failure.corrected_response[:500],
-                "timestamp": failure.timestamp,
-            }
-            self.patterns["corrections"].append(pattern)
-
-            # Keep only recent patterns
-            self.patterns["corrections"] = self.patterns["corrections"][-100:]
-
-        self.stats.patterns_learned = len(self.patterns["corrections"])
-        self._save_patterns()
-
-    def _trigger_rebuild(self):
-        """Trigger Modelfile rebuild with new training data."""
-        if self.verbose:
-            print(f"\n[SelfImprove] Triggering training rebuild...")
-
-        try:
-            # Generate updated Modelfile
-            from training.generate_training_data import generate_ollama_modelfile
-
-            modelfile_path = Path(__file__).parent / "Modelfile"
-            generate_ollama_modelfile(output_path=str(modelfile_path))
-
-            self.stats.last_training_update = datetime.now().isoformat()
-
-            if self.verbose:
-                print(f"  Modelfile updated at {modelfile_path}")
-                print(f"  Run: ollama create coding-assistant -f {modelfile_path}")
-
-        except Exception as e:
-            if self.verbose:
-                print(f"  Error rebuilding: {e}")
-
-    def get_stats(self) -> dict:
-        """Get improvement statistics."""
-        return {
-            "total_failures": self.stats.total_failures,
-            "failures_fixed": self.stats.failures_fixed,
-            "fix_rate": f"{(self.stats.failures_fixed / max(1, self.stats.total_failures)) * 100:.1f}%",
-            "training_examples_added": self.stats.training_examples_added,
-            "patterns_learned": self.stats.patterns_learned,
-            "last_training_update": self.stats.last_training_update,
-            "pending_improvements": self.pending_improvements,
-        }
-
-    def get_failure_summary(self, limit: int = 10) -> list[dict]:
-        """Get recent failures for review."""
-        failures = []
-        if self.failures_file.exists():
-            with open(self.failures_file) as f:
-                for line in f:
-                    if line.strip():
-                        failures.append(json.loads(line))
-
-        return failures[-limit:]
-
-    def process_user_correction(
-        self,
-        user_message: str,
-        wrong_response: str,
-        correct_response: str
-    ):
-        """
-        Process explicit user correction.
-
-        Call this when user says something like:
-        "No, that's wrong. The correct way is..."
-        """
-        failure = FailureRecord(
-            category=FailureCategory.USER_CORRECTION,
+        return self.audit_and_improve(
             user_message=user_message,
-            assistant_response=wrong_response,
-            error_details="User provided correction",
-            corrected_response=correct_response,
-            root_cause="User correction - model output didn't match expected behavior"
+            zima_response=assistant_response,
+            tool_results=tool_results,
         )
-
-        self._process_failure(failure)
-
-        if self.verbose:
-            print(f"[SelfImprove] Learned from user correction")
-
-    def analyze_patterns(self) -> dict:
-        """Analyze failure patterns to identify improvement areas."""
-        analysis = {
-            "most_common_failures": [],
-            "recommendations": [],
-        }
-
-        # Count failure types
-        failure_counts = self.patterns.get("failure_types", {})
-        sorted_failures = sorted(failure_counts.items(), key=lambda x: x[1], reverse=True)
-
-        analysis["most_common_failures"] = sorted_failures[:5]
-
-        # Generate recommendations
-        for category, count in sorted_failures[:3]:
-            if category == "command_as_tool":
-                analysis["recommendations"].append(
-                    "Add more examples showing commands inside <command> tags"
-                )
-            elif category == "tool_format":
-                analysis["recommendations"].append(
-                    "Strengthen XML format training with more diverse examples"
-                )
-            elif category == "hallucination":
-                analysis["recommendations"].append(
-                    "Add examples that emphasize using tools for actions"
-                )
-
-        return analysis
 
 
 # =============================================================================
@@ -579,9 +849,10 @@ def main():
     import argparse
 
     parser = argparse.ArgumentParser(description='Zima Self-Improvement System')
-    parser.add_argument('command', choices=['stats', 'failures', 'analyze', 'rebuild'],
+    parser.add_argument('command', choices=['stats', 'analyze', 'rules', 'rebuild', 'audit'],
                        help='Command to run')
-    parser.add_argument('--limit', '-l', type=int, default=10, help='Limit for failures list')
+    parser.add_argument('--message', '-m', type=str, help='User message for audit')
+    parser.add_argument('--response', '-r', type=str, help='Response to audit')
 
     args = parser.parse_args()
 
@@ -589,36 +860,52 @@ def main():
 
     if args.command == 'stats':
         stats = improver.get_stats()
-        print("\nSelf-Improvement Statistics")
-        print("=" * 40)
+        print("\n=== Self-Improvement Statistics ===")
         for key, value in stats.items():
             print(f"  {key}: {value}")
 
-    elif args.command == 'failures':
-        failures = improver.get_failure_summary(args.limit)
-        print(f"\nRecent Failures ({len(failures)})")
-        print("=" * 40)
-        for f in failures:
-            print(f"\n  [{f['category']}] {f['timestamp'][:19]}")
-            print(f"    User: {f['user_message'][:60]}...")
-            print(f"    Error: {f['error_details'][:80]}")
-            print(f"    Corrected: {'Yes' if f['corrected'] else 'No'}")
-
     elif args.command == 'analyze':
         analysis = improver.analyze_patterns()
-        print("\nFailure Pattern Analysis")
-        print("=" * 40)
+        print("\n=== Failure Pattern Analysis ===")
         print("\nMost Common Failures:")
         for category, count in analysis["most_common_failures"]:
             print(f"  {category}: {count}")
+        print(f"\nLearned Rules: {analysis['learned_rules_count']}")
         print("\nRecommendations:")
         for rec in analysis["recommendations"]:
             print(f"  - {rec}")
 
+    elif args.command == 'rules':
+        rules = improver.get_learned_rules(20)
+        print("\n=== Learned Rules ===")
+        for rule in rules:
+            print(f"\n  [{rule['category']}] {rule['description'][:60]}")
+            print(f"    Fix: {rule['fix'][:80]}")
+
     elif args.command == 'rebuild':
-        print("Triggering training rebuild...")
+        print("Triggering Modelfile rebuild...")
         improver._trigger_rebuild()
         print("Done. Run: ollama create coding-assistant -f Modelfile")
+
+    elif args.command == 'audit':
+        if not args.message or not args.response:
+            print("Usage: python self_improve.py audit -m 'user message' -r 'response'")
+            return
+
+        print("\nAuditing response...")
+        result = improver.audit_and_improve(args.message, args.response)
+
+        print(f"\nScore: {result.score}/100")
+        print(f"Passed: {'Yes' if result.passed else 'No'}")
+        print(f"Issues: {len(result.issues)}")
+
+        for issue in result.issues:
+            print(f"\n  [{issue.severity.value}] {issue.category.value}")
+            print(f"    {issue.description}")
+            print(f"    Fix: {issue.suggestion}")
+
+        if result.fixed_response:
+            print(f"\n=== Fixed Response ===\n{result.fixed_response[:500]}")
 
 
 if __name__ == "__main__":

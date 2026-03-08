@@ -233,6 +233,7 @@ def handle_command(command: str, agent: CodingAgent, skills_manager: SkillsManag
                     console.print("\nMost Common Failures:")
                     for category, count in analysis["most_common_failures"]:
                         console.print(f"  • {category}: {count}")
+                console.print(f"\nLearned Rules: {analysis.get('learned_rules_count', 0)}")
                 if analysis.get("recommendations"):
                     console.print("\nRecommendations:")
                     for rec in analysis["recommendations"]:
@@ -244,20 +245,34 @@ def handle_command(command: str, agent: CodingAgent, skills_manager: SkillsManag
                 console.print("[green]Done. Run: ollama create coding-assistant -f Modelfile[/green]")
             else:
                 console.print("[yellow]Self-improvement is disabled.[/yellow]")
+        elif args == "rules":
+            if agent.self_improver:
+                rules = agent.self_improver.get_learned_rules(15)
+                if rules:
+                    console.print("\n[bold]Learned Rules:[/bold]")
+                    for rule in rules:
+                        console.print(f"\n  [{rule['category']}] {rule['description'][:60]}")
+                        console.print(f"    [dim]Fix: {rule['fix'][:80]}[/dim]")
+                else:
+                    console.print("[dim]No rules learned yet.[/dim]")
+            else:
+                console.print("[yellow]Self-improvement is disabled.[/yellow]")
         else:
             stats = agent.get_improvement_stats()
             if stats.get("enabled") is False:
                 console.print("[yellow]Self-improvement is disabled.[/yellow]")
             else:
                 console.print("\n[bold]Self-Improvement Statistics:[/bold]")
-                console.print(f"  • Total failures: {stats['total_failures']}")
-                console.print(f"  • Failures fixed: {stats['failures_fixed']}")
-                console.print(f"  • Fix rate: {stats['fix_rate']}")
-                console.print(f"  • Training examples added: {stats['training_examples_added']}")
-                console.print(f"  • Patterns learned: {stats['patterns_learned']}")
-                if stats.get('last_training_update'):
-                    console.print(f"  • Last rebuild: {stats['last_training_update'][:19]}")
-                console.print(f"\n[dim]Commands: /improve analyze, /improve rebuild[/dim]")
+                console.print(f"  • Claude auditor: {'[green]Available[/green]' if stats.get('claude_available') else '[yellow]Unavailable[/yellow]'}")
+                console.print(f"  • Total audits: {stats.get('total_audits', 0)}")
+                console.print(f"  • Pass rate: {stats.get('pass_rate', '0%')}")
+                console.print(f"  • Issues found: {stats.get('issues_found', 0)}")
+                console.print(f"  • Issues fixed: {stats.get('issues_fixed', 0)}")
+                console.print(f"  • Training examples: {stats.get('training_examples_added', 0)}")
+                console.print(f"  • Prompt updates: {stats.get('prompt_updates', 0)}")
+                if stats.get('last_audit'):
+                    console.print(f"  • Last audit: {stats['last_audit'][:19]}")
+                console.print(f"\n[dim]Commands: /improve analyze | rules | rebuild[/dim]")
         console.print()
 
     elif cmd == "/init":
